@@ -2,6 +2,12 @@ AGENTS.md
 .vercel
 .env
 node_modules/
+docs/.next/
+docs/out/
+docs/.vercel/
+adapters/opencode/node_modules/
+adapters/opencode/.vitest/
+*.tgz
 video/out/
 video/public/sounds/
 video/src/*Preview.tsx
@@ -25,3 +31,4 @@ result
 result-*
 .direnv
 .envrc.local
+.mise/
