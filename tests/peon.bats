@@ -1944,6 +1944,46 @@ JSON
   ! linux_audio_was_called
 }
 
+@test "devcontainer prefers mounted UNIX socket relay" {
+  export PLATFORM=devcontainer
+  export PEON_RELAY_SOCKET="$TEST_DIR/.peon-relay.sock"
+  start_mock_unix_socket "$PEON_RELAY_SOCKET"
+  touch "$TEST_DIR/.relay_socket_available"
+  run_peon '{"hook_event_name":"Stop","cwd":"/tmp/myproject","session_id":"s1","permission_mode":"default"}'
+  [ "$PEON_EXIT" -eq 0 ]
+  relay_was_called
+  grep -q -- "--unix-socket $PEON_RELAY_SOCKET" "$TEST_DIR/relay_curl.log"
+  grep -q "http://localhost/play?" "$TEST_DIR/relay_curl.log"
+}
+
+@test "devcontainer falls back to TCP when configured UNIX socket is missing" {
+  export PLATFORM=devcontainer
+  export PEON_RELAY_SOCKET="$TEST_DIR/.missing-relay.sock"
+  touch "$TEST_DIR/.relay_available"
+  run_peon '{"hook_event_name":"Stop","cwd":"/tmp/myproject","session_id":"s1","permission_mode":"default"}'
+  [ "$PEON_EXIT" -eq 0 ]
+  relay_was_called
+  cmdline=$(relay_cmdline)
+  [[ "$cmdline" != *"--unix-socket"* ]]
+  [[ "$cmdline" == *"host.docker.internal:19998"* ]]
+}
+
+@test "devcontainer falls back to TCP when UNIX socket relay fails" {
+  export PLATFORM=devcontainer
+  export PEON_RELAY_SOCKET="$TEST_DIR/.peon-relay.sock"
+  start_mock_unix_socket "$PEON_RELAY_SOCKET"
+  rm -f "$TEST_DIR/.relay_socket_available"
+  touch "$TEST_DIR/.relay_available"
+  run_peon '{"hook_event_name":"Stop","cwd":"/tmp/myproject","session_id":"s1","permission_mode":"default"}'
+  [ "$PEON_EXIT" -eq 0 ]
+  play_call_count=$(grep -c "/play?" "$TEST_DIR/relay_curl.log")
+  [ "$play_call_count" -eq 2 ]
+  first_play=$(grep "/play?" "$TEST_DIR/relay_curl.log" | head -n 1)
+  last_play=$(grep "/play?" "$TEST_DIR/relay_curl.log" | tail -n 1)
+  [[ "$first_play" == *"--unix-socket $PEON_RELAY_SOCKET"* ]]
+  [[ "$last_play" == *"host.docker.internal:19998"* ]]
+}
+
 @test "devcontainer exits cleanly when relay unavailable" {
   export PLATFORM=devcontainer
   # .relay_available NOT created, so mock curl returns exit 7
@@ -2019,6 +2059,19 @@ JSON
   # Should have both /play and /notify relay calls
   relay_was_called
   grep -q "/notify" "$TEST_DIR/relay_curl.log"
+}
+
+@test "devcontainer notification prefers mounted UNIX socket relay" {
+  export PLATFORM=devcontainer
+  export PEON_RELAY_SOCKET="$TEST_DIR/.peon-relay.sock"
+  start_mock_unix_socket "$PEON_RELAY_SOCKET"
+  touch "$TEST_DIR/.relay_socket_available"
+  run_peon '{"hook_event_name":"PermissionRequest","cwd":"/tmp/myproject","session_id":"s1","permission_mode":"default"}'
+  [ "$PEON_EXIT" -eq 0 ]
+  relay_was_called
+  cmdline=$(relay_cmdline)
+  [[ "$cmdline" == *"/notify"* ]]
+  [[ "$cmdline" == *"--unix-socket $PEON_RELAY_SOCKET"* ]]
 }
 
 # ============================================================

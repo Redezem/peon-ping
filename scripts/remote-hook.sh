@@ -20,10 +20,12 @@
 #
 # The relay URL defaults to localhost:19998 (SSH tunnel). Override with:
 #   PEON_RELAY_URL=http://host.docker.internal:19998  (for devcontainers)
+#   PEON_RELAY_SOCKET=/.peon-relay.sock               (preferred when mounted into a container)
 #
 set -uo pipefail
 
 RELAY_URL="${PEON_RELAY_URL:-http://127.0.0.1:19998}"
+RELAY_SOCKET="${PEON_RELAY_SOCKET:-/.peon-relay.sock}"
 
 # Parse hook event from JSON stdin
 EVENT=$(cat | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('hook_event_name',''))" 2>/dev/null)
@@ -36,5 +38,20 @@ case "$EVENT" in
   *)                 exit 0 ;;  # Ignore other events
 esac
 
+send_category() {
+  local category="$1"
+  local endpoint="/play?category=${category}"
+
+  if [ -S "$RELAY_SOCKET" ]; then
+    if curl -sf --connect-timeout 1 --max-time 2 \
+      --unix-socket "$RELAY_SOCKET" "http://localhost${endpoint}" >/dev/null 2>&1; then
+      return 0
+    fi
+  fi
+
+  curl -sf --connect-timeout 1 --max-time 2 \
+    "${RELAY_URL}${endpoint}" >/dev/null 2>&1
+}
+
 # Fire and forget - don't block Claude Code
-curl -sf "${RELAY_URL}/play?category=${CATEGORY}" >/dev/null 2>&1 &
+send_category "$CATEGORY" &

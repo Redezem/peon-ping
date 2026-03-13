@@ -92,16 +92,29 @@ export interface PeonConfig {
 
 export type RuntimePlatform = "mac" | "linux" | "wsl" | "ssh" | "devcontainer"
 
-export interface RelayConfig {
+export interface RelayTCPConfig {
+  type: "tcp"
   host: string
   port: number
 }
+
+export interface RelayUnixConfig {
+  type: "unix"
+  socketPath: string
+  fallbackHost: string
+  fallbackPort: number
+}
+
+export type RelayConfig = RelayTCPConfig | RelayUnixConfig
+
+export const DEFAULT_RELAY_SOCKET_PATH = "/.peon-relay.sock"
 
 export function detectPlatform(): RuntimePlatform {
   if (process.env.SSH_CONNECTION || process.env.SSH_CLIENT) return "ssh"
   if (process.env.REMOTE_CONTAINERS || process.env.CODESPACES) return "devcontainer"
   if (os.platform() === "linux") {
     try {
+      if (fs.existsSync("/.dockerenv")) return "devcontainer"
       const ver = fs.readFileSync("/proc/version", "utf8")
       if (/microsoft/i.test(ver)) return "wsl"
     } catch {}
@@ -111,14 +124,34 @@ export function detectPlatform(): RuntimePlatform {
   return "linux"
 }
 
-export function getRelayConfig(config: PeonConfig, platform: RuntimePlatform): RelayConfig {
+export function getRelayTCPConfig(config: PeonConfig, platform: RuntimePlatform): RelayTCPConfig {
   const host = config.relay_host
     || process.env.PEON_RELAY_HOST
     || (platform === "devcontainer" ? "host.docker.internal" : "localhost")
   const port = config.relay_port
     || Number(process.env.PEON_RELAY_PORT)
     || 19998
-  return { host, port }
+  return { type: "tcp", host, port }
+}
+
+export function getRelaySocketPath(): string {
+  return process.env.PEON_RELAY_SOCKET || DEFAULT_RELAY_SOCKET_PATH
+}
+
+export function getRelayConfig(config: PeonConfig, platform: RuntimePlatform): RelayConfig {
+  const tcp = getRelayTCPConfig(config, platform)
+  if (platform === "devcontainer") {
+    const socketPath = getRelaySocketPath()
+    if (fs.existsSync(socketPath)) {
+      return {
+        type: "unix",
+        socketPath,
+        fallbackHost: tcp.host,
+        fallbackPort: tcp.port,
+      }
+    }
+  }
+  return tcp
 }
 
 /** Internal runtime state */

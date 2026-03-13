@@ -12,6 +12,7 @@ setup() {
   # Derive relay.sh path from PEON_SH (set in setup.bash from its own location)
   RELAY_SH="$(dirname "$PEON_SH")/relay.sh"
   RELAY_PORT=19876  # Use non-default port to avoid conflicts
+  RELAY_SOCKET="$TEST_DIR/relay.sock"
   RELAY_PID=""
 }
 
@@ -49,6 +50,20 @@ start_relay() {
   return 1
 }
 
+start_relay_with_socket() {
+  bash "$RELAY_SH" --port="$RELAY_PORT" --unix-socket="$RELAY_SOCKET" --peon-dir="$TEST_DIR" > /dev/null 2>&1 &
+  RELAY_PID=$!
+
+  for i in $(seq 1 30); do
+    if [ -S "$RELAY_SOCKET" ] && "$REAL_CURL" -sf --unix-socket "$RELAY_SOCKET" "http://localhost/health" > /dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "Relay with unix socket failed to start" >&2
+  return 1
+}
+
 # ── Help and CLI ──────────────────────────────────────────────────────────────
 
 @test "relay --help shows usage" {
@@ -56,6 +71,7 @@ start_relay() {
   [ "$status" -eq 0 ]
   [[ "$output" == *"Usage:"* ]]
   [[ "$output" == *"--port"* ]]
+  [[ "$output" == *"--unix-socket"* ]]
   [[ "$output" == *"--daemon"* ]]
 }
 
@@ -71,6 +87,13 @@ start_relay() {
 @test "relay /health returns 200 OK" {
   start_relay
   run "$REAL_CURL" -sf "http://127.0.0.1:$RELAY_PORT/health"
+  [ "$status" -eq 0 ]
+  [ "$output" = "OK" ]
+}
+
+@test "relay /health works over UNIX socket when enabled" {
+  start_relay_with_socket
+  run "$REAL_CURL" -sf --unix-socket "$RELAY_SOCKET" "http://localhost/health"
   [ "$status" -eq 0 ]
   [ "$output" = "OK" ]
 }
@@ -126,6 +149,15 @@ start_relay() {
 @test "relay /notify accepts POST with JSON body" {
   start_relay
   run "$REAL_CURL" -sf -X POST "http://127.0.0.1:$RELAY_PORT/notify" \
+    -H "Content-Type: application/json" \
+    -d '{"title":"peon-ping","message":"Test notification"}'
+  [ "$status" -eq 0 ]
+  [ "$output" = "OK" ]
+}
+
+@test "relay /notify accepts POST over UNIX socket" {
+  start_relay_with_socket
+  run "$REAL_CURL" -sf --unix-socket "$RELAY_SOCKET" -X POST "http://localhost/notify" \
     -H "Content-Type: application/json" \
     -d '{"title":"peon-ping","message":"Test notification"}'
   [ "$status" -eq 0 ]
@@ -208,6 +240,36 @@ start_relay() {
   # pidfile should be removed
   [ ! -f "$TEST_DIR/.relay.pid" ]
   RELAY_PID=""
+}
+
+@test "relay --daemon removes UNIX socket on stop" {
+  run bash "$RELAY_SH" --daemon --port="$RELAY_PORT" --unix-socket="$RELAY_SOCKET" --peon-dir="$TEST_DIR"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"UNIX socket"* ]]
+
+  [ -f "$TEST_DIR/.relay.pid" ]
+  RELAY_PID=$(cat "$TEST_DIR/.relay.pid")
+
+  for i in $(seq 1 50); do
+    if [ -S "$RELAY_SOCKET" ] && "$REAL_CURL" -sf --unix-socket "$RELAY_SOCKET" "http://localhost/health" > /dev/null 2>&1; then
+      break
+    fi
+    sleep 0.1
+  done
+  [ -S "$RELAY_SOCKET" ]
+
+  run bash "$RELAY_SH" --stop --peon-dir="$TEST_DIR"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"stopped"* ]]
+  [ ! -e "$RELAY_SOCKET" ]
+  RELAY_PID=""
+}
+
+@test "relay fails when UNIX socket path exists as a regular file" {
+  printf 'occupied' > "$RELAY_SOCKET"
+  run bash "$RELAY_SH" --port="$RELAY_PORT" --unix-socket="$RELAY_SOCKET" --peon-dir="$TEST_DIR"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"not a socket"* ]]
 }
 
 @test "relay --daemon prevents duplicate start" {

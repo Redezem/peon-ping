@@ -6,6 +6,7 @@
 #   peon relay                          Start relay on default port (19998)
 #   peon relay --port=12345             Start relay on custom port
 #   peon relay --bind=0.0.0.0           Listen on all interfaces (for remote SSH)
+#   peon relay --unix-socket=/path      Also listen on a UNIX socket
 #   peon relay --daemon                 Start relay in background
 #   peon relay --stop                   Stop background relay
 #   peon relay --status                 Check if relay is running
@@ -29,6 +30,7 @@ if [ ! -d "$PEON_DIR/packs" ] && [ -d "$HOME/.openpeon/packs" ]; then
   PEON_DIR="$HOME/.openpeon"
 fi
 BIND_ADDR="${PEON_RELAY_BIND:-127.0.0.1}"
+UNIX_SOCKET="${PEON_RELAY_SOCKET:-}"
 DAEMON_MODE=false
 DAEMON_ACTION=""
 
@@ -37,11 +39,12 @@ for arg in "$@"; do
     --port=*)     RELAY_PORT="${arg#--port=}" ;;
     --peon-dir=*) PEON_DIR="${arg#--peon-dir=}" ;;
     --bind=*)     BIND_ADDR="${arg#--bind=}" ;;
+    --unix-socket=*) UNIX_SOCKET="${arg#--unix-socket=}" ;;
     --daemon)     DAEMON_MODE=true ;;
     --stop)       DAEMON_ACTION="stop" ;;
     --status)     DAEMON_ACTION="status" ;;
     --help|-h)
-      echo "Usage: peon relay [--port=PORT] [--bind=ADDR] [--peon-dir=DIR]"
+      echo "Usage: peon relay [--port=PORT] [--bind=ADDR] [--unix-socket=PATH] [--peon-dir=DIR]"
       echo ""
       echo "Starts the peon-ping audio relay server on this machine."
       echo "Remote SSH sessions and devcontainers send audio requests to this relay."
@@ -49,6 +52,7 @@ for arg in "$@"; do
       echo "Options:"
       echo "  --port=PORT       Port to listen on (default: 19998)"
       echo "  --bind=ADDR       Address to bind to (default: 127.0.0.1)"
+      echo "  --unix-socket=PATH Also listen on a UNIX socket"
       echo "  --peon-dir=DIR    peon-ping install directory"
       echo "  --daemon          Run in background (writes PID to .relay.pid)"
       echo "  --stop            Stop a background relay"
@@ -57,6 +61,7 @@ for arg in "$@"; do
       echo "Environment variables:"
       echo "  PEON_RELAY_PORT   Same as --port"
       echo "  PEON_RELAY_BIND   Same as --bind"
+      echo "  PEON_RELAY_SOCKET Same as --unix-socket"
       echo "  CLAUDE_PEON_DIR   Same as --peon-dir"
       echo ""
       echo "SSH setup:"
@@ -83,6 +88,12 @@ if [ "$DAEMON_ACTION" = "stop" ]; then
     pid=$(cat "$PIDFILE" 2>/dev/null)
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
       kill "$pid" 2>/dev/null
+      for _ in $(seq 1 30); do
+        if ! kill -0 "$pid" 2>/dev/null; then
+          break
+        fi
+        sleep 0.1
+      done
       rm -f "$PIDFILE"
       echo "peon-ping relay stopped (PID $pid)"
     else
@@ -100,7 +111,11 @@ if [ "$DAEMON_ACTION" = "status" ]; then
   if [ -f "$PIDFILE" ]; then
     pid=$(cat "$PIDFILE" 2>/dev/null)
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-      echo "peon-ping relay is running (PID $pid, port $RELAY_PORT)"
+      if [ -n "$UNIX_SOCKET" ]; then
+        echo "peon-ping relay is running (PID $pid, port $RELAY_PORT, unix socket $UNIX_SOCKET)"
+      else
+        echo "peon-ping relay is running (PID $pid, port $RELAY_PORT)"
+      fi
       exit 0
     else
       rm -f "$PIDFILE"
@@ -137,7 +152,7 @@ case "$(uname -s)" in
   *)      HOST_PLATFORM="unknown" ;;
 esac
 
-export RELAY_PORT PEON_DIR BIND_ADDR HOST_PLATFORM
+export RELAY_PORT PEON_DIR BIND_ADDR HOST_PLATFORM UNIX_SOCKET
 
 # --- Daemon mode: fork to background ---
 if [ "$DAEMON_MODE" = "true" ]; then
@@ -152,10 +167,17 @@ if [ "$DAEMON_MODE" = "true" ]; then
   fi
 
   # Fork to background
-  nohup bash "$0" --port="$RELAY_PORT" --bind="$BIND_ADDR" --peon-dir="$PEON_DIR" > "$LOGFILE" 2>&1 &
+  relay_args=( --port="$RELAY_PORT" --bind="$BIND_ADDR" --peon-dir="$PEON_DIR" )
+  if [ -n "$UNIX_SOCKET" ]; then
+    relay_args+=( --unix-socket="$UNIX_SOCKET" )
+  fi
+  nohup bash "$0" "${relay_args[@]}" > "$LOGFILE" 2>&1 &
   echo "$!" > "$PIDFILE"
   echo "peon-ping relay started in background (PID $!)"
   echo "  Listening: ${BIND_ADDR}:${RELAY_PORT}"
+  if [ -n "$UNIX_SOCKET" ]; then
+    echo "  UNIX socket: $UNIX_SOCKET"
+  fi
   echo "  Log: $LOGFILE"
   echo "  Stop: peon relay --stop"
   exit 0
@@ -163,22 +185,30 @@ fi
 
 echo "peon-ping relay v2.0 (category-aware)"
 echo "  Listening: ${BIND_ADDR}:${RELAY_PORT}"
+if [ -n "$UNIX_SOCKET" ]; then
+  echo "  UNIX socket: ${UNIX_SOCKET}"
+fi
 echo "  Peon dir:  ${PEON_DIR}"
 echo "  Platform:  ${HOST_PLATFORM}"
 echo "  Press Ctrl+C to stop"
 echo ""
 
 # --- HTTP relay server (embedded Python) ---
-exec python3 - "$PEON_DIR" "$HOST_PLATFORM" "$BIND_ADDR" "$RELAY_PORT" <<'PYEOF'
+exec python3 - "$PEON_DIR" "$HOST_PLATFORM" "$BIND_ADDR" "$RELAY_PORT" "$UNIX_SOCKET" <<'PYEOF'
 import http.server
 import json
 import os
 import posixpath
 import random
+import signal
+import socket
+import socketserver
+import stat
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.parse
 
@@ -186,6 +216,7 @@ PEON_DIR = os.path.realpath(sys.argv[1])
 HOST_PLATFORM = sys.argv[2]
 BIND_ADDR = sys.argv[3]
 PORT = int(sys.argv[4])
+UNIX_SOCKET_PATH = sys.argv[5]
 
 CONFIG_FILE = os.path.join(PEON_DIR, "config.json")
 STATE_FILE = os.path.join(PEON_DIR, ".state.json")
@@ -603,11 +634,104 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"OK")
 
+class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
 
-server = http.server.HTTPServer((BIND_ADDR, PORT), RelayHandler)
+
+class ThreadingUnixHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+servers = []
+server_threads = []
+socket_cleanup_paths = []
+stop_event = threading.Event()
+
+
+def cleanup_socket_path(path):
+    if path and os.path.lexists(path):
+        try:
+            st = os.lstat(path)
+        except OSError:
+            return
+        if stat.S_ISSOCK(st.st_mode):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
+def create_unix_server(path):
+    if not hasattr(socket, "AF_UNIX"):
+        raise RuntimeError("UNIX sockets are not supported on this host runtime")
+
+    parent = os.path.dirname(path) or "."
+    os.makedirs(parent, exist_ok=True)
+
+    if os.path.lexists(path):
+        st = os.lstat(path)
+        if stat.S_ISSOCK(st.st_mode):
+            os.unlink(path)
+        else:
+            raise RuntimeError(f"UNIX socket path already exists and is not a socket: {path}")
+
+    server = ThreadingUnixHTTPServer(path, RelayHandler)
+    os.chmod(path, 0o666)
+    socket_cleanup_paths.append(path)
+    return server
+
+
+def serve(server):
+    server.serve_forever(poll_interval=0.2)
+
+
+def request_shutdown(_signum=None, _frame=None):
+    stop_event.set()
+
+
 try:
-    server.serve_forever()
+    servers.append(ThreadingHTTPServer((BIND_ADDR, PORT), RelayHandler))
+    if UNIX_SOCKET_PATH:
+        servers.append(create_unix_server(UNIX_SOCKET_PATH))
+except Exception as exc:
+    for server in servers:
+        try:
+            server.server_close()
+        except Exception:
+            pass
+    for cleanup_path in socket_cleanup_paths:
+        cleanup_socket_path(cleanup_path)
+    print(f"Error: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+for sig_name in ("SIGINT", "SIGTERM"):
+    if hasattr(signal, sig_name):
+        signal.signal(getattr(signal, sig_name), request_shutdown)
+
+for server in servers:
+    thread = threading.Thread(target=serve, args=(server,), daemon=True)
+    thread.start()
+    server_threads.append(thread)
+
+try:
+    while not stop_event.is_set():
+        time.sleep(0.2)
 except KeyboardInterrupt:
+    stop_event.set()
+finally:
+    for server in servers:
+        try:
+            server.shutdown()
+        except Exception:
+            pass
+    for server in servers:
+        try:
+            server.server_close()
+        except Exception:
+            pass
+    for cleanup_path in socket_cleanup_paths:
+        cleanup_socket_path(cleanup_path)
     print("\npeon-ping relay stopped.")
-    server.server_close()
 PYEOF

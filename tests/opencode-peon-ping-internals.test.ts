@@ -485,8 +485,6 @@ describe("createSpamChecker", () => {
 // ---------------------------------------------------------------------------
 
 describe("detectPlatform", () => {
-  const savedEnv = { ...process.env }
-
   afterEach(() => {
     // Restore environment
     delete process.env.SSH_CONNECTION
@@ -494,6 +492,7 @@ describe("detectPlatform", () => {
     delete process.env.REMOTE_CONTAINERS
     delete process.env.CODESPACES
     vi.mocked(os.platform).mockReturnValue("darwin")
+    vi.mocked(fs.existsSync).mockReturnValue(false)
   })
 
   it("returns 'ssh' when SSH_CONNECTION is set", () => {
@@ -523,8 +522,15 @@ describe("detectPlatform", () => {
 
   it("returns 'linux' on linux without SSH/WSL", () => {
     vi.mocked(os.platform).mockReturnValue("linux")
+    vi.mocked(fs.existsSync).mockReturnValue(false)
     vi.mocked(fs.readFileSync).mockReturnValue("Linux version 5.15.0")
     expect(detectPlatform()).toBe("linux")
+  })
+
+  it("returns 'devcontainer' when /.dockerenv exists", () => {
+    vi.mocked(os.platform).mockReturnValue("linux")
+    vi.mocked(fs.existsSync).mockImplementation((p: fs.PathLike) => p === "/.dockerenv")
+    expect(detectPlatform()).toBe("devcontainer")
   })
 
   it("SSH takes priority over devcontainer when both are set", () => {
@@ -542,38 +548,65 @@ describe("getRelayConfig", () => {
   afterEach(() => {
     delete process.env.PEON_RELAY_HOST
     delete process.env.PEON_RELAY_PORT
+    delete process.env.PEON_RELAY_SOCKET
+    vi.mocked(fs.existsSync).mockReturnValue(false)
   })
 
   it("returns localhost:19998 for SSH platform with no overrides", () => {
     const config: PeonConfig = { ...DEFAULT_CONFIG }
     const relay = getRelayConfig(config, "ssh")
-    expect(relay).toEqual({ host: "localhost", port: 19998 })
+    expect(relay).toEqual({ type: "tcp", host: "localhost", port: 19998 })
   })
 
-  it("returns host.docker.internal:19998 for devcontainer with no overrides", () => {
+  it("returns host.docker.internal:19998 TCP fallback for devcontainer with no socket", () => {
     const config: PeonConfig = { ...DEFAULT_CONFIG }
     const relay = getRelayConfig(config, "devcontainer")
-    expect(relay).toEqual({ host: "host.docker.internal", port: 19998 })
+    expect(relay).toEqual({ type: "tcp", host: "host.docker.internal", port: 19998 })
+  })
+
+  it("prefers a mounted UNIX socket for devcontainer", () => {
+    vi.mocked(fs.existsSync).mockImplementation((p: fs.PathLike) => String(p) === "/.peon-relay.sock")
+    const config: PeonConfig = { ...DEFAULT_CONFIG }
+    const relay = getRelayConfig(config, "devcontainer")
+    expect(relay).toEqual({
+      type: "unix",
+      socketPath: "/.peon-relay.sock",
+      fallbackHost: "host.docker.internal",
+      fallbackPort: 19998,
+    })
+  })
+
+  it("respects PEON_RELAY_SOCKET for devcontainer UNIX socket selection", () => {
+    process.env.PEON_RELAY_SOCKET = "/tmp/custom.sock"
+    vi.mocked(fs.existsSync).mockImplementation((p: fs.PathLike) => String(p) === "/tmp/custom.sock")
+    const config: PeonConfig = { ...DEFAULT_CONFIG }
+    const relay = getRelayConfig(config, "devcontainer")
+    expect(relay).toEqual({
+      type: "unix",
+      socketPath: "/tmp/custom.sock",
+      fallbackHost: "host.docker.internal",
+      fallbackPort: 19998,
+    })
   })
 
   it("respects PEON_RELAY_HOST env var override", () => {
     process.env.PEON_RELAY_HOST = "custom-host"
     const config: PeonConfig = { ...DEFAULT_CONFIG }
     const relay = getRelayConfig(config, "ssh")
-    expect(relay.host).toBe("custom-host")
+    expect(relay).toMatchObject({ type: "tcp", host: "custom-host" })
   })
 
   it("respects PEON_RELAY_PORT env var override", () => {
     process.env.PEON_RELAY_PORT = "12345"
     const config: PeonConfig = { ...DEFAULT_CONFIG }
     const relay = getRelayConfig(config, "ssh")
-    expect(relay.port).toBe(12345)
+    expect(relay).toMatchObject({ type: "tcp", port: 12345 })
   })
 
   it("respects config relay_host / relay_port fields", () => {
     const config: PeonConfig = { ...DEFAULT_CONFIG, relay_host: "cfg-host", relay_port: 9999 }
     const relay = getRelayConfig(config, "ssh")
-    expect(relay).toEqual({ host: "cfg-host", port: 9999 })
+    expect(relay).toEqual({ type: "tcp", host: "cfg-host", port: 9999 })
   })
 
   it("config fields take priority over env vars", () => {
@@ -581,6 +614,6 @@ describe("getRelayConfig", () => {
     process.env.PEON_RELAY_PORT = "11111"
     const config: PeonConfig = { ...DEFAULT_CONFIG, relay_host: "cfg-host", relay_port: 9999 }
     const relay = getRelayConfig(config, "ssh")
-    expect(relay).toEqual({ host: "cfg-host", port: 9999 })
+    expect(relay).toEqual({ type: "tcp", host: "cfg-host", port: 9999 })
   })
 })

@@ -29,6 +29,7 @@
  */
 
 import * as fs from "node:fs"
+import * as http from "node:http"
 import * as path from "node:path"
 import * as os from "node:os"
 import type { Plugin } from "@opencode-ai/plugin"
@@ -116,16 +117,29 @@ interface PeonState {
 
 type RuntimePlatform = "mac" | "linux" | "wsl" | "ssh" | "devcontainer"
 
-interface RelayConfig {
+interface RelayTCPConfig {
+  type: "tcp"
   host: string
   port: number
 }
+
+interface RelayUnixConfig {
+  type: "unix"
+  socketPath: string
+  fallbackHost: string
+  fallbackPort: number
+}
+
+type RelayConfig = RelayTCPConfig | RelayUnixConfig
+
+const DEFAULT_RELAY_SOCKET_PATH = "/.peon-relay.sock"
 
 function detectPlatform(): RuntimePlatform {
   if (process.env.SSH_CONNECTION || process.env.SSH_CLIENT) return "ssh"
   if (process.env.REMOTE_CONTAINERS || process.env.CODESPACES) return "devcontainer"
   if (os.platform() === "linux") {
     try {
+      if (fs.existsSync("/.dockerenv")) return "devcontainer"
       const ver = fs.readFileSync("/proc/version", "utf8")
       if (/microsoft/i.test(ver)) return "wsl"
     } catch {}
@@ -135,14 +149,105 @@ function detectPlatform(): RuntimePlatform {
   return "linux"
 }
 
-function getRelayConfig(config: PeonConfig, platform: RuntimePlatform): RelayConfig {
+function getRelayTCPConfig(config: PeonConfig, platform: RuntimePlatform): RelayTCPConfig {
   const host = config.relay_host
     || process.env.PEON_RELAY_HOST
     || (platform === "devcontainer" ? "host.docker.internal" : "localhost")
   const port = config.relay_port
     || Number(process.env.PEON_RELAY_PORT)
     || 19998
-  return { host, port }
+  return { type: "tcp", host, port }
+}
+
+function getRelaySocketPath(): string {
+  return process.env.PEON_RELAY_SOCKET || DEFAULT_RELAY_SOCKET_PATH
+}
+
+function relaySocketMounted(socketPath: string): boolean {
+  try {
+    return fs.statSync(socketPath).isSocket()
+  } catch {
+    return false
+  }
+}
+
+function getRelayConfig(config: PeonConfig, platform: RuntimePlatform): RelayConfig {
+  const tcp = getRelayTCPConfig(config, platform)
+  if (platform === "devcontainer") {
+    const socketPath = getRelaySocketPath()
+    if (relaySocketMounted(socketPath)) {
+      return {
+        type: "unix",
+        socketPath,
+        fallbackHost: tcp.host,
+        fallbackPort: tcp.port,
+      }
+    }
+  }
+  return tcp
+}
+
+function relayTargetLabel(relay: RelayConfig): string {
+  return relay.type === "unix"
+    ? `${relay.socketPath} or ${relay.fallbackHost}:${relay.fallbackPort}`
+    : `${relay.host}:${relay.port}`
+}
+
+function relayRequest(
+  relay: RelayConfig,
+  relayPath: string,
+  options: {
+    method?: "GET" | "POST"
+    headers?: Record<string, string>
+    body?: string
+    timeoutMs?: number
+  } = {},
+): Promise<number> {
+  const {
+    method = "GET",
+    headers = {},
+    body,
+    timeoutMs = 1000,
+  } = options
+
+  const attempt = (requestOptions: http.RequestOptions): Promise<number> =>
+    new Promise((resolve, reject) => {
+      const req = http.request(
+        {
+          ...requestOptions,
+          method,
+          path: relayPath,
+          headers,
+          timeout: timeoutMs,
+        },
+        (res) => {
+          res.resume()
+          resolve(res.statusCode ?? 0)
+        },
+      )
+      req.on("error", reject)
+      req.on("timeout", () => req.destroy(new Error("timeout")))
+      if (body !== undefined) {
+        req.write(body)
+      }
+      req.end()
+    })
+
+  if (relay.type === "unix") {
+    return attempt({
+      socketPath: relay.socketPath,
+      host: "localhost",
+    }).catch(() =>
+      attempt({
+        host: relay.fallbackHost,
+        port: relay.fallbackPort,
+      }))
+  }
+
+  return attempt({
+    host: relay.host,
+    port: relay.port,
+  })
 }
 
 // ---------------------------------------------------------------------------
@@ -440,8 +545,9 @@ function playSound(
     const packsParent = path.dirname(packsDir)
     const relPath = path.relative(packsParent, filePath)
     const encoded = encodeURIComponent(relPath)
-    fetch(`http://${relay.host}:${relay.port}/play?file=${encoded}`, {
+    relayRequest(relay, `/play?file=${encoded}`, {
       headers: { "X-Volume": String(volume) },
+      timeoutMs: 2000,
     }).catch(() => {})
     return
   }
@@ -567,10 +673,11 @@ function sendNotification(
 ): void {
   // SSH / devcontainer: relay notification to local machine
   if ((runtimePlatform === "ssh" || runtimePlatform === "devcontainer") && relay) {
-    fetch(`http://${relay.host}:${relay.port}/notify`, {
+    relayRequest(relay, "/notify", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ title: opts.title, message: opts.body }),
+      timeoutMs: 2000,
     }).catch(() => {})
     return
   }
@@ -817,14 +924,14 @@ export const PeonPingPlugin: Plugin = async ({ directory }) => {
 
   // --- Relay health check on init (SSH/devcontainer only) ---
   if (relay) {
-    fetch(`http://${relay.host}:${relay.port}/health`)
-      .then((res) => {
-        if (!res.ok) {
-          console.warn(`[peon-ping] relay health check failed (HTTP ${res.status})`)
+    relayRequest(relay, "/health")
+      .then((status) => {
+        if (status < 200 || status >= 300) {
+          console.warn(`[peon-ping] relay health check failed (HTTP ${status})`)
         }
       })
       .catch(() => {
-        console.warn(`[peon-ping] relay unreachable at ${relay.host}:${relay.port} — sounds will not play`)
+        console.warn(`[peon-ping] relay unreachable at ${relayTargetLabel(relay)} — sounds will not play`)
       })
   }
 

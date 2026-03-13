@@ -295,8 +295,17 @@ if [[ "$_curl_url" == *"/sounds/"* ]] && [ -n "$_curl_output" ]; then
 fi
 
 # Check if this is a relay request (devcontainer/SSH audio/notification/health)
+_relay_has_unix_socket=0
+_relay_prev=""
 for arg in "$@"; do
-  if [[ "$arg" == *"/play?"* ]] || [[ "$arg" == *"/health"* ]]; then
+  if [ "$_relay_prev" = "--unix-socket" ]; then
+    _relay_has_unix_socket=1
+  fi
+  _relay_prev="$arg"
+done
+
+for arg in "$@"; do
+  if [[ "$arg" == *"/play?"* ]] || [[ "$arg" == *"/health"* ]] || [[ "$arg" == *"/notify"* ]] || [[ "$arg" == *"/state"* ]]; then
     echo "RELAY: $*" >> "${CLAUDE_PEON_DIR}/relay_curl.log"
     # For /play requests, also log to afplay.log so afplay_was_called works
     if [[ "$arg" == *"/play?"* ]]; then
@@ -304,6 +313,7 @@ for arg in "$@"; do
       file=$(echo "$arg" | sed -n 's/.*file=\([^&]*\).*/\1/p' | sed 's/%2F/\//g')
       # Extract volume from headers (look for -H X-Volume: in args)
       volume="0.5"
+      unset prev
       for i in "$@"; do
         if [[ "$prev" == "-H" ]] && [[ "$i" == "X-Volume:"* ]]; then
           volume=$(echo "$i" | cut -d: -f2 | tr -d ' ')
@@ -313,16 +323,12 @@ for arg in "$@"; do
       # Write in afplay format: -v 0.5 /full/path/to/sound.wav
       echo "-v $volume ${CLAUDE_PEON_DIR}/$file" >> "${CLAUDE_PEON_DIR}/afplay.log"
     fi
-    if [ -f "${CLAUDE_PEON_DIR}/.relay_available" ]; then
-      exit 0
-    else
+    if [ "$_relay_has_unix_socket" -eq 1 ]; then
+      [ -f "${CLAUDE_PEON_DIR}/.relay_socket_available" ] && exit 0
       exit 7
     fi
-  fi
-  # Relay notify (devcontainer/SSH POST)
-  if [[ "$arg" == *"/notify"* ]] && [[ "$arg" == *"19998"* || "$arg" == *"12345"* ]]; then
-    echo "RELAY: $*" >> "${CLAUDE_PEON_DIR}/relay_curl.log"
-    exit 0
+    [ -f "${CLAUDE_PEON_DIR}/.relay_available" ] && exit 0
+    exit 7
   fi
   # Mobile push notification services
   if [[ "$arg" == *"ntfy.sh"* ]] || [[ "$arg" == *"ntfy/"* ]]; then
@@ -375,6 +381,7 @@ SCRIPT
 
   # Locate peon.sh (relative to this test file)
   PEON_SH="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/peon.sh"
+  REMOTE_HOOK_SH="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/scripts/remote-hook.sh"
   # Change to TEST_DIR so PWD-based local config lookup does not pick up
   # a real installation config (e.g. with pack_rotation) from outside the test env
   cd "$TEST_DIR"
@@ -383,6 +390,11 @@ SCRIPT
 teardown_test_env() {
   # Clean up relay mock
   rm -f "$TEST_DIR/.relay_available" 2>/dev/null || true
+  rm -f "$TEST_DIR/.relay_socket_available" 2>/dev/null || true
+  if [ -n "${TEST_UNIX_SOCKET_PID:-}" ] && kill -0 "$TEST_UNIX_SOCKET_PID" 2>/dev/null; then
+    kill "$TEST_UNIX_SOCKET_PID" 2>/dev/null || true
+    wait "$TEST_UNIX_SOCKET_PID" 2>/dev/null || true
+  fi
   rm -rf "$TEST_DIR" 2>/dev/null || true
 }
 
@@ -414,6 +426,16 @@ run_peon() {
   echo "$json" | bash "$PEON_SH" 2>"$TEST_DIR/stderr.log"
   PEON_EXIT=$?
   PEON_STDERR=$(cat "$TEST_DIR/stderr.log" 2>/dev/null)
+}
+
+run_remote_hook() {
+  local json="$1"
+  export PEON_TEST=1
+  : > "$TEST_DIR/remote_hook_stderr.log"
+  echo "$json" | bash "$REMOTE_HOOK_SH" 2>"$TEST_DIR/remote_hook_stderr.log"
+  REMOTE_HOOK_EXIT=$?
+  REMOTE_HOOK_STDERR=$(cat "$TEST_DIR/remote_hook_stderr.log" 2>/dev/null)
+  sleep 0.1
 }
 
 # Helper: check if afplay was called
@@ -484,6 +506,46 @@ relay_call_count() {
   else
     echo "0"
   fi
+}
+
+start_mock_unix_socket() {
+  local socket_path="${1:-$TEST_DIR/.peon-relay.sock}"
+  rm -f "$socket_path"
+  python3 - "$socket_path" <<'PY' &
+import os
+import socket
+import sys
+import time
+
+sock_path = sys.argv[1]
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.bind(sock_path)
+sock.listen(1)
+sock.settimeout(0.2)
+
+try:
+    while True:
+        try:
+            conn, _ = sock.accept()
+            conn.close()
+        except socket.timeout:
+            continue
+except KeyboardInterrupt:
+    pass
+finally:
+    sock.close()
+    try:
+        os.unlink(sock_path)
+    except OSError:
+        pass
+PY
+  TEST_UNIX_SOCKET_PID=$!
+  for _ in $(seq 1 20); do
+    [ -S "$socket_path" ] && return 0
+    sleep 0.05
+  done
+  echo "mock unix socket failed to start at $socket_path" >&2
+  return 1
 }
 
 # Helper: get the resolved icon path

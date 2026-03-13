@@ -2,6 +2,11 @@
 
 ### Added
 - **Nix/Home Manager: custom pack sources** — `installPacks` now accepts both simple strings (for og-packs) and attribute sets with `name` and `src` fields to install packs from any source. The `src` field accepts any Nix fetcher result (e.g., `pkgs.fetchFromGitHub`), enabling community packs from the [openpeon.com registry](https://openpeon.com/) that aren't in og-packs while maintaining full reproducibility.
+- **Optional UNIX relay socket for containers** — `peon relay --unix-socket=/path` now adds a UNIX-domain-socket listener alongside the existing TCP relay. Container clients prefer a mounted socket at `/.peon-relay.sock` and fall back to `host.docker.internal` automatically. The shell client, OpenCode adapter, remote hook, README, and Nix service modules all understand the new transport.
+
+### Fixed
+- **Remote relay helper fallback** — `scripts/remote-hook.sh` now retries `PEON_RELAY_URL` when a mounted `PEON_RELAY_SOCKET` exists but is unreachable, restoring the advertised degraded path for stale/broken sockets.
+- **NixOS UNIX relay socket sandboxing** — enabling `services.peon-ping-relay.unixSocketPath` now disables `PrivateTmp` and grants write access to the socket parent directory so host-visible UNIX sockets can actually be created.
 
 ## v2.15.1 (2026-03-09)
 

@@ -27,6 +27,12 @@ in
       default = "127.0.0.1";
       description = "Address to bind to";
     };
+
+    unixSocketPath = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      description = "Optional UNIX socket path for bind-mounting the relay into containers";
+    };
     
     logDir = mkOption {
       type = types.str;
@@ -47,7 +53,7 @@ in
           "relay" 
           "--port=${toString cfg.port}"
           "--bind=${cfg.bindAddress}"
-        ];
+        ] ++ optional (cfg.unixSocketPath != null) "--unix-socket=${cfg.unixSocketPath}";
         KeepAlive = true;
         ThrottleInterval = 30;
         RunAtLoad = true;

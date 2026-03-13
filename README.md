@@ -889,7 +889,16 @@ peon ssh-audio local   # always play on SSH host
 
 ### Devcontainers / Codespaces
 
-No port forwarding needed — peon-ping auto-detects `REMOTE_CONTAINERS` and `CODESPACES` environment variables and routes audio to `host.docker.internal:19998`. Just run `peon relay --daemon` on your host machine.
+If you can mount a host UNIX socket into the container, peon-ping now prefers that over the network relay:
+
+```bash
+peon relay --daemon --unix-socket=/tmp/peon-relay.sock
+docker run -v /tmp/peon-relay.sock:/.peon-relay.sock ...
+```
+
+Inside the container, peon-ping auto-detects `REMOTE_CONTAINERS`, `CODESPACES`, and Docker/devcontainer runtimes, then tries `/.peon-relay.sock` first. If the socket is missing or unreachable, it falls back to `host.docker.internal:19998`.
+
+On NixOS, prefer `/tmp/peon-relay.sock` for `services.peon-ping-relay.unixSocketPath`. If you use another path, create the parent directory ahead of time and make sure it is host-visible and writable by the service.
 
 ### Relay commands
 
@@ -900,9 +909,10 @@ peon relay --stop         # Stop background relay
 peon relay --status       # Check if relay is running
 peon relay --port=12345   # Custom port (default: 19998)
 peon relay --bind=0.0.0.0 # Listen on all interfaces (less secure)
+peon relay --unix-socket=/tmp/peon-relay.sock # Also listen on a UNIX socket
 ```
 
-Environment variables: `PEON_RELAY_PORT`, `PEON_RELAY_HOST`, `PEON_RELAY_BIND`.
+Environment variables: `PEON_RELAY_PORT`, `PEON_RELAY_HOST`, `PEON_RELAY_BIND`, `PEON_RELAY_SOCKET`.
 
 If peon-ping detects an SSH or container session but can't reach the relay, it prints setup instructions on `SessionStart`.
 
@@ -924,6 +934,7 @@ The relay supports a category-based endpoint that handles sound selection server
 ```bash
 #!/bin/bash
 RELAY_URL="${PEON_RELAY_URL:-http://127.0.0.1:19998}"
+RELAY_SOCKET="${PEON_RELAY_SOCKET:-/.peon-relay.sock}"
 EVENT=$(cat | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('hook_event_name',''))" 2>/dev/null)
 case "$EVENT" in
   SessionStart)      CATEGORY="session.start" ;;
@@ -931,7 +942,18 @@ case "$EVENT" in
   PermissionRequest) CATEGORY="input.required" ;;
   *)                 exit 0 ;;
 esac
-curl -sf "${RELAY_URL}/play?category=${CATEGORY}" >/dev/null 2>&1 &
+send_category() {
+  local endpoint="/play?category=$1"
+  if [ -S "$RELAY_SOCKET" ]; then
+    if curl -sf --connect-timeout 1 --max-time 2 \
+      --unix-socket "$RELAY_SOCKET" "http://localhost${endpoint}" >/dev/null 2>&1; then
+      return 0
+    fi
+  fi
+  curl -sf --connect-timeout 1 --max-time 2 \
+    "${RELAY_URL}${endpoint}" >/dev/null 2>&1
+}
+send_category "${CATEGORY}" &
 ```
 
 Copy this to your remote machine and register it in `~/.claude/settings.json`:
@@ -1062,4 +1084,3 @@ Sound packs are downloaded from the [OpenPeon registry](https://github.com/PeonP
 
 - Venmo: [@garysheng](https://venmo.com/garysheng)
 - Community Token (DYOR / have fun): Someone created a $PEON token on Base — we receive TX fees which help fund development. [`0xf4ba744229afb64e2571eef89aacec2f524e8ba3`](https://dexscreener.com/base/0xf4bA744229aFB64E2571eef89AaceC2F524e8bA3)
-

@@ -161,6 +161,7 @@ export PEON_ENV_GLOBAL_CONFIG="$GLOBAL_CONFIG_PY"
 export PEON_ENV_STATE="$STATE_PY"
 export PEON_ENV_PEON_DIR="$PEON_DIR_PY"
 export PEON_ENV_PLATFORM="$PLATFORM"
+export PEON_ENV_RELAY_SOCKET="${PEON_RELAY_SOCKET:-/.peon-relay.sock}"
 
 # --- Safe eval: only allow lines matching VAR=value (defense-in-depth for Python output) ---
 safe_eval_python() {
@@ -342,6 +343,68 @@ ssh_audio_mode() {
   echo "$mode"
 }
 
+relay_socket_path() {
+  echo "${PEON_RELAY_SOCKET:-/.peon-relay.sock}"
+}
+
+relay_host_default() {
+  local platform="${1:-$PLATFORM}"
+  if [ "$platform" = "devcontainer" ]; then
+    echo "host.docker.internal"
+  else
+    echo "localhost"
+  fi
+}
+
+relay_host() {
+  local platform="${1:-$PLATFORM}"
+  local default_host
+  default_host="$(relay_host_default "$platform")"
+  echo "${PEON_RELAY_HOST:-$default_host}"
+}
+
+relay_port() {
+  echo "${PEON_RELAY_PORT:-19998}"
+}
+
+relay_request_sync() {
+  local endpoint="$1"
+  shift
+
+  local -a curl_args=(-sf --connect-timeout 1 --max-time 2)
+  local socket_path host port
+
+  if [ "$PLATFORM" = "devcontainer" ]; then
+    socket_path="$(relay_socket_path)"
+    if [ -S "$socket_path" ]; then
+      if curl "${curl_args[@]}" --unix-socket "$socket_path" "$@" "http://localhost${endpoint}"; then
+        return 0
+      fi
+    fi
+  fi
+
+  host="$(relay_host "$PLATFORM")"
+  port="$(relay_port)"
+  curl "${curl_args[@]}" "$@" "http://${host}:${port}${endpoint}"
+}
+
+relay_request() {
+  local mode="$1"
+  shift
+  local endpoint="$1"
+  shift
+
+  if [ "$mode" = "async" ] && [ "${PEON_TEST:-0}" != "1" ]; then
+    export PLATFORM PEON_TEST PEON_RELAY_SOCKET PEON_RELAY_HOST PEON_RELAY_PORT
+    export -f relay_socket_path relay_host_default relay_host relay_port relay_request_sync
+    nohup bash -c 'relay_request_sync "$@"' _ "$endpoint" "$@" >/dev/null 2>&1 &
+    printf '%s\n' "$!"
+    return 0
+  fi
+
+  relay_request_sync "$endpoint" "$@"
+}
+
 # --- Platform-aware audio playback ---
 play_sound() {
   local file="$1" vol="$2"
@@ -378,10 +441,6 @@ play_sound() {
       save_sound_pid $!
       ;;
     devcontainer|ssh)
-      local relay_host_default="host.docker.internal"
-      [ "$PLATFORM" = "ssh" ] && relay_host_default="localhost"
-      local relay_host="${PEON_RELAY_HOST:-$relay_host_default}"
-      local relay_port="${PEON_RELAY_PORT:-19998}"
       local rel_path="${file#$PEON_DIR/}"
       local encoded_path
       encoded_path=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$rel_path" 2>/dev/null || echo "$rel_path")
@@ -399,8 +458,7 @@ play_sound() {
         fi
       # SSH auto mode tries relay first, then falls back to local playback.
       elif [ "$PLATFORM" = "ssh" ] && [ "$ssh_mode" = "auto" ]; then
-        if curl -sf --connect-timeout 1 --max-time 2 -H "X-Volume: $vol" \
-          "http://${relay_host}:${relay_port}/play?file=${encoded_path}" >/dev/null 2>&1; then
+        if relay_request_sync "/play?file=${encoded_path}" -H "X-Volume: $vol" >/dev/null 2>&1; then
           :
         else
           local player
@@ -412,12 +470,11 @@ play_sound() {
         fi
       else
         if [ "${PEON_TEST:-0}" = "1" ]; then
-          curl -sf -H "X-Volume: $vol" \
-            "http://${relay_host}:${relay_port}/play?file=${encoded_path}" 2>/dev/null
+          relay_request "sync" "/play?file=${encoded_path}" -H "X-Volume: $vol" >/dev/null 2>&1
         else
-          nohup curl -sf -H "X-Volume: $vol" \
-            "http://${relay_host}:${relay_port}/play?file=${encoded_path}" >/dev/null 2>&1 &
-          save_sound_pid $!
+          local relay_pid
+          relay_pid=$(relay_request "async" "/play?file=${encoded_path}" -H "X-Volume: $vol")
+          [ -n "$relay_pid" ] && save_sound_pid "$relay_pid"
         fi
       fi
       ;;
@@ -587,23 +644,17 @@ send_notification() {
       bash "$notify_script" "$msg" "$title" "$color" "$icon_path"
       ;;
     devcontainer|ssh)
-      local relay_host_default="host.docker.internal"
-      [ "$PLATFORM" = "ssh" ] && relay_host_default="localhost"
-      local relay_host="${PEON_RELAY_HOST:-$relay_host_default}"
-      local relay_port="${PEON_RELAY_PORT:-19998}"
       local json_title json_msg
       json_title=$(python3 -c "import json,sys; print(json.dumps(sys.argv[1]))" "$title" 2>/dev/null || echo "\"$title\"")
       json_msg=$(python3 -c "import json,sys; print(json.dumps(sys.argv[1]))" "$msg" 2>/dev/null || echo "\"$msg\"")
       if [ "$use_bg" = true ]; then
-        nohup curl -sf -X POST \
+        relay_request "async" "/notify" -X POST \
           -H "Content-Type: application/json" \
-          -d "{\"title\":${json_title},\"message\":${json_msg},\"color\":\"$color\"}" \
-          "http://${relay_host}:${relay_port}/notify" >/dev/null 2>&1 &
+          -d "{\"title\":${json_title},\"message\":${json_msg},\"color\":\"$color\"}" >/dev/null 2>&1
       else
-        curl -sf -X POST \
+        relay_request "sync" "/notify" -X POST \
           -H "Content-Type: application/json" \
-          -d "{\"title\":${json_title},\"message\":${json_msg},\"color\":\"$color\"}" \
-          "http://${relay_host}:${relay_port}/notify" >/dev/null 2>&1
+          -d "{\"title\":${json_title},\"message\":${json_msg},\"color\":\"$color\"}" >/dev/null 2>&1
       fi
       ;;
   esac
@@ -2522,6 +2573,7 @@ Relay (SSH/devcontainer/Codespaces):
   ssh-audio [mode]        SSH routing mode: relay (default), auto, or local
   relay [--port=N]        Start audio relay on your local machine
   relay --bind=<addr>     Bind relay to a specific address (default: 127.0.0.1)
+  relay --unix-socket=<path>  Also listen on a UNIX socket for mounted containers
   relay --daemon          Start relay in background
   relay --stop            Stop background relay
   relay --status          Check if relay is running
@@ -3444,20 +3496,61 @@ if state_dirty:
     json.dump(state, open(state_file, 'w'))
     # --- Relay state push ---
     if state.get('last_active'):
+        import http.client as _httpc
+        import socket as _socket
+        import stat as _stat
         import urllib.request as _ureq
         _relay_platform = os.environ.get('PEON_ENV_PLATFORM', '')
+        _relay_socket = os.environ.get('PEON_RELAY_SOCKET',
+            os.environ.get('PEON_ENV_RELAY_SOCKET', '/.peon-relay.sock'))
         _relay_host = os.environ.get('PEON_RELAY_HOST',
             'host.docker.internal' if _relay_platform == 'devcontainer' else 'localhost')
         _relay_port = os.environ.get('PEON_RELAY_PORT', '19998')
+        def _post_state_unix(socket_path, body):
+            if _relay_platform != 'devcontainer' or not hasattr(_socket, 'AF_UNIX'):
+                return False
+            try:
+                st = os.stat(socket_path)
+                if not _stat.S_ISSOCK(st.st_mode):
+                    return False
+            except OSError:
+                return False
+
+            class _UnixHTTPConnection(_httpc.HTTPConnection):
+                def __init__(self, path, timeout=1):
+                    super().__init__('localhost', timeout=timeout)
+                    self._path = path
+
+                def connect(self):
+                    self.sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+                    self.sock.settimeout(self.timeout)
+                    self.sock.connect(self._path)
+
+            conn = None
+            try:
+                conn = _UnixHTTPConnection(socket_path, timeout=1)
+                conn.request('POST', '/state', body=body, headers={'Content-Type': 'application/json'})
+                resp = conn.getresponse()
+                resp.read()
+                return 200 <= resp.status < 300
+            except Exception:
+                return False
+            finally:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
         try:
             _body = json.dumps({'last_active': state['last_active']}).encode()
-            _req = _ureq.Request(
-                f'http://{_relay_host}:{_relay_port}/state',
-                data=_body,
-                headers={'Content-Type': 'application/json'},
-                method='POST',
-            )
-            _ureq.urlopen(_req, timeout=1)
+            if not _post_state_unix(_relay_socket, _body):
+                _req = _ureq.Request(
+                    f'http://{_relay_host}:{_relay_port}/state',
+                    data=_body,
+                    headers={'Content-Type': 'application/json'},
+                    method='POST',
+                )
+                _ureq.urlopen(_req, timeout=1)
         except Exception:
             pass
 
@@ -3622,20 +3715,21 @@ fi
 # Backgrounded in production to avoid blocking the greeting sound while curl times out.
 _relay_guidance() {
   if [ "$PLATFORM" = "devcontainer" ]; then
-    RELAY_HOST="${PEON_RELAY_HOST:-host.docker.internal}"
-    RELAY_PORT="${PEON_RELAY_PORT:-19998}"
-    if ! curl -sf --connect-timeout 1 --max-time 2 "http://${RELAY_HOST}:${RELAY_PORT}/health" >/dev/null 2>&1; then
-      echo "peon-ping: devcontainer detected but audio relay not reachable at ${RELAY_HOST}:${RELAY_PORT}" >&2
-      echo "peon-ping: run 'peon relay' on your host machine to enable sounds" >&2
+    RELAY_SOCKET="$(relay_socket_path)"
+    RELAY_HOST="$(relay_host "$PLATFORM")"
+    RELAY_PORT="$(relay_port)"
+    if ! relay_request_sync "/health" >/dev/null 2>&1; then
+      echo "peon-ping: devcontainer detected but audio relay not reachable via ${RELAY_SOCKET} or ${RELAY_HOST}:${RELAY_PORT}" >&2
+      echo "peon-ping: mount your host relay socket to ${RELAY_SOCKET} or run 'peon relay' on your host machine" >&2
     fi
   elif [ "$PLATFORM" = "ssh" ]; then
     local _ssh_mode
     _ssh_mode="$(ssh_audio_mode)"
     # In local/auto mode, SSH can play locally without relay.
     [ "$_ssh_mode" = "relay" ] || return 0
-    RELAY_HOST="${PEON_RELAY_HOST:-localhost}"
-    RELAY_PORT="${PEON_RELAY_PORT:-19998}"
-    if ! curl -sf --connect-timeout 1 --max-time 2 "http://${RELAY_HOST}:${RELAY_PORT}/health" >/dev/null 2>&1; then
+    RELAY_HOST="$(relay_host "$PLATFORM")"
+    RELAY_PORT="$(relay_port)"
+    if ! relay_request_sync "/health" >/dev/null 2>&1; then
       echo "peon-ping: SSH session detected but audio relay not reachable at ${RELAY_HOST}:${RELAY_PORT}" >&2
       echo "peon-ping: on your LOCAL machine, run: peon relay" >&2
       echo "peon-ping: then reconnect with: ssh -R 19998:localhost:19998 <host>" >&2
